@@ -12,9 +12,10 @@ import numpy as np
 os.environ["PYTHONPATH"] = os.getcwd()
 
 import logging
-
+import json
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.FATAL)
+
 import tensorflow as tf
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
@@ -45,18 +46,18 @@ class Driver:
         simdt=1,
         max_steps=1024,
         speeds=[0, 0, 84],
+        alt_level_separation=500,
         LOS=10,
         dGoal=100,
-        maxRewardDistance=100,
         intruderThreshold=750,
-        rewardBeta=0.001,
-        rewardAlpha=0.1,
-        speedChangePenalty=0.001,
-        rewardLOS=-1,
+        altChangePenalty=0.001,
         stepPenalty=0,
         clearancePenalty=0.005,
         gui=False,
         non_coop_tag=0,
+        max_alt = 3000,
+        min_alt = 1000,
+        weighting_factor_noise=0.5,
         weights_file=None,
         run_type="train",
         traffic_manager_active=True,
@@ -70,40 +71,34 @@ class Driver:
         self.iterations = iterations
         self.max_steps = max_steps
         self.speeds = speeds
+
+        self.alt_level_separation = alt_level_separation
+        self.max_alt = max_alt
+        self.min_alt = min_alt
+        self.weighting_factor_noise=weighting_factor_noise
+
         self.LOS = LOS
         self.dGoal = dGoal
-        self.maxRewardDistance = maxRewardDistance
         self.intruderThreshold = intruderThreshold
-        self.rewardBeta = rewardBeta
-        self.rewardAlpha = rewardAlpha
-        self.speedChangePenalty = speedChangePenalty
-        self.rewardLOS = rewardLOS
+        self.altChangePenalty = altChangePenalty
         self.stepPenalty = stepPenalty
         self.clearancePenalty = clearancePenalty
         self.scenario_file = scenario_file
         self.config_file = config_file
         self.weights_file = weights_file
         self.gui = gui
-        self.speed_only = False
-        if self.speed_only:
-            self.action_dim = 3
-            self.observation_dim = 6
-            self.context_dim = 8
-        else:
-            self.action_dim = 3
-            self.observation_dim = 4
-            self.context_dim = 3
+
+
+        self.action_dim = 3
+        self.observation_dim = 5
+        self.context_dim = 3
+
         self.agent = Agent()
         self.agent_template = deepcopy(self.agent)
         self.working_directory = os.getcwd()
         self.non_coop_tag = non_coop_tag
         self.traffic_manager_active = traffic_manager_active
         self.n_waypoints = n_waypoints
-        if self.speed_only:
-            if self.traffic_manager_active:
-                self.observation_dim += 2
-            self.observation_dim += 2 * self.n_waypoints
-            self.context_dim += 2 * self.n_waypoints
 
         self.agent.initialize(
             tf, self.observation_dim, self.context_dim, self.action_dim
@@ -136,12 +131,11 @@ class Driver:
                 speeds=self.speeds,
                 LOS=self.LOS,
                 dGoal=self.dGoal,
-                maxRewardDistance=self.maxRewardDistance,
                 intruderThreshold=self.intruderThreshold,
-                rewardBeta=self.rewardBeta,
-                rewardAlpha=self.rewardAlpha,
-                speedChangePenalty=self.speedChangePenalty,
-                rewardLOS=self.rewardLOS,
+                altChangePenalty=self.altChangePenalty,
+                weighting_factor_noise=self.weighting_factor_noise,
+                max_alt = self.max_alt,
+                min_alt = self.min_alt,
                 stepPenalty=self.stepPenalty,
                 clearancePenalty=self.clearancePenalty,
                 gui=self.gui,
@@ -198,7 +192,7 @@ class Driver:
                     nmacs.append(data[0]["nmacs"])
 
                     total_nmac_time += [data[0]["nmac_time"]]
-
+                    max_noise_increase = float(data[0]['max_noise_increase'])
                     total_ac.append(data[0]["total_ac"])
 
             if total_reward:
@@ -208,6 +202,7 @@ class Driver:
                 print(f"     Scenario Complete     ")
                 print("|------------------------------|")
                 print(f"| Total NMACS:      {nmac}      |")
+                print(f"| Maximum Noise Increase: {max_noise_increase}  |")
                 print(f"| Total Aircraft:   {total_ac[j]}  |")
                 print("|------------------------------|")
                 print(" ")
@@ -237,6 +232,7 @@ class Driver:
                 mean_total_reward = 0
 
             print(f"     Iteration {i} Complete     ")
+            print(f"Name of Training Run: {self.run_name}")
             print("|------------------------------|")
             print(f"| Mean Total Reward:   {np.round(mean_total_reward,1)}  |")
             roll_mean = np.mean(rewards[-150:])
@@ -253,32 +249,6 @@ class Driver:
                         )
 
                 self.agent.model.save_weights("{}/model.h5".format(self.path_models))
-
-            # for agent_id in workers_to_remove:
-            #     workers[agent_id] = Runner.remote(
-            #         agent_id,
-            #         self.agent_template,
-            #         scenario_file=self.scenario_file,
-            #         config_file=self.config_file,
-            #         working_directory=self.working_directory,
-            #         max_steps=self.max_steps,
-            #         simdt=self.simdt,
-            #         speeds=self.speeds,
-            #         LOS=self.LOS,
-            #         dGoal=self.dGoal,
-            #         maxRewardDistance=self.maxRewardDistance,
-            #         intruderThreshold=self.intruderThreshold,
-            #         rewardBeta=self.rewardBeta,
-            #         rewardAlpha=self.rewardAlpha,
-            #         speedChangePenalty=self.speedChangePenalty,
-            #         rewardLOS=self.rewardLOS,
-            #         stepPenalty=self.stepPenalty,
-            #         gui=self.gui,
-            #         non_coop_tag = self.non_coop_tag,
-            #     )
-
-            # if len(workers_to_remove) > 0:
-            #     time.sleep(5)
 
             runner_sims = [
                 workers[agent_id].run_one_iteration.remote(weights)
@@ -299,12 +269,11 @@ class Driver:
                 speeds=self.speeds,
                 LOS=self.LOS,
                 dGoal=self.dGoal,
-                maxRewardDistance=self.maxRewardDistance,
                 intruderThreshold=self.intruderThreshold,
-                rewardBeta=self.rewardBeta,
-                rewardAlpha=self.rewardAlpha,
-                speedChangePenalty=self.speedChangePenalty,
-                rewardLOS=self.rewardLOS,
+                altChangePenalty=self.altChangePenalty,
+                weighting_factor_noise=self.weighting_factor_noise,
+                max_alt = self.max_alt,
+                min_alt = self.min_alt,
                 stepPenalty=self.stepPenalty,
                 clearancePenalty=self.clearancePenalty,
                 gui=self.gui,
@@ -317,10 +286,13 @@ class Driver:
 
         rewards = []
         total_nmacs = []
+        cumulative_nmacs = 0
         total_nmac_time = []
         iteration_record = []
         total_transitions = 0
         best_reward = -np.inf
+        scenario = 0
+        metric_list =[]
 
         if self.agent.equipped:
             self.agent.model.load_weights(self.weights_file)
@@ -347,20 +319,37 @@ class Driver:
                 total_reward.append(float(np.sum(data[0]["raw_reward"])))
                 if data[0]["environment_done"]:
                     nmacs.append(data[0]["nmacs"])
+                    cumulative_nmacs += data[0]["nmacs"]
                     total_nmac_time += [data[0]["nmac_time"]]
                     total_ac.append(data[0]["total_ac"])
+                    max_noise_increase = float(data[0]['max_noise_increase'])
+                    avg_noise_increase = data[0]['avg_noise_increase']
+                    congestion_distribution = data[0]['congestion_distribution']
+                    avg_noise_dict = {}
+                    for id_ in avg_noise_increase.keys():
+                        avg_noise_dict[id_] = np.mean(avg_noise_increase[id_])
 
             mean_total_reward = np.mean(total_reward)
 
             for j, nmac in enumerate(nmacs):
-                print(f"     Scenario Complete     ")
+                print(f"     Scenario Complete {self.run_name}    ")
                 print("|------------------------------|")
                 print(f"| Total NMACS:      {nmac}      |")
+                print(f"| Maximum Noise Increase: {max_noise_increase}  |")
                 print(f"| Total Aircraft:   {total_ac[j]}  |")
                 print("|------------------------------|")
                 print(" ")
                 total_nmacs.append(nmac)
                 iteration_record.append(i)
+                metric_dict = {}
+                metric_dict['scenario_num'] = scenario
+                scenario += 1
+                metric_dict['los'] = int(cumulative_nmacs)
+                cumulative_nmacs = 0
+                metric_dict['max_noise'] = float(max_noise_increase)
+                metric_dict['avg_noise'] = avg_noise_dict
+                metric_dict['congestion_distribution'] = congestion_distribution
+                metric_list.append(metric_dict)
 
             rewards.append(mean_total_reward)
             np.save("{}/eval_reward.npy".format(self.path_results), np.array(rewards))
@@ -380,24 +369,18 @@ class Driver:
                     np.array(iteration_record),
                 )
 
-            # total_transitions += transitions
-
-            print(f"     Iteration {i} Complete     ")
-            print("|------------------------------|")
-            print(f"| Mean Total Reward:   {np.round(mean_total_reward,1)}  |")
-            roll_mean = np.mean(rewards[-150:])
-            print(f"| Rolling Mean Reward: {np.round(roll_mean,1)}  |")
-            print("|------------------------------|")
-            print(" ")
-
             runner_sims = [
                 workers[agent_id].run_one_iteration.remote(weights)
                 for agent_id in workers.keys()
             ]
-
+        folder_path = 'log/test_models'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+        with open('log/test_models/{}.json'.format(self.run_name), 'w') as file:
+            json.dump(metric_list, file, indent=4)
 
 ### Main code execution
-gin.parse_config_file("conf/config.gin")
+gin.parse_config_file("conf/config_test.gin")
 
 if args.cluster:
     ## Initialize Ray

@@ -3,7 +3,7 @@ import yaml
 import random
 
 
-file_path = '/home/suryamurthy/UT_Autonomous_Group/vls_mod_alt/D2MAV_A/DFW_towers.yaml'
+file_path = '/home/suryamurthy/UT_Autonomous_Group/vls_mod_alt/D2MAV_A/Austin_towers.yaml'
 
 # Reading data from the YAML file
 with open(file_path, 'r') as file:

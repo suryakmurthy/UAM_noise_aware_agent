@@ -123,7 +123,7 @@ def generate_scenario_austin_2(out_path, demand_dict_path, route_dict_path, dep_
                 
                 first_wpt = route_dict[route_name][0] + route_dict[route_name][1] + "1"
                 last_wpt = route_dict[route_name][-2] + route_dict[route_name][-1] + "2"
-                entries.append((time, f">CRE {plane},Mavic,{first_wpt},0,0\n"))
+                entries.append((time, f">CRE {plane},EC35,{first_wpt},0,0\n"))
                 entries.append((time, f">ORIG {plane} {first_wpt}\n"))
                 entries.append((time, f">DEST {plane} {last_wpt}\n"))
                 entries.append((time, f">SPD {plane} 40\n"))
@@ -157,7 +157,7 @@ def generate_scenario_austin(out_path, demand_dict_path, route_dict_path, dep_in
     folder_path = out_path
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
-    f = open(out_path + f"/austin_env_full_ver_4.scn", "w")
+    f = open(out_path + f"/austin_env_full_ver_5.scn", "w")
 
     f.write("00:00:00.00>TRAILS ON \n")
     f.write("\n")
@@ -196,7 +196,7 @@ def generate_scenario_austin(out_path, demand_dict_path, route_dict_path, dep_in
 
 # Test Scenario Generation:
 intervals = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
-generate_scenario_austin_2(f'/home/suryamurthy/UT_Autonomous_Group/ILASMS_func3a-update-routes/scenarios/generated_scenarios', '/home/suryamurthy/UT_Autonomous_Group/ILASMS_func3a-update-routes/D2MAV_A/route_demand_dict.json', '/home/suryamurthy/UT_Autonomous_Group/ILASMS_func3a-update-routes/D2MAV_A/route_info_dict.json', 120)
+generate_scenario_austin_2(f'/home/suryamurthy/UT_Autonomous_Group/ILASMS_func3a-update-routes/scenarios/generated_scenarios', '/home/suryamurthy/UT_Autonomous_Group/ILASMS_func3a-update-routes/D2MAV_A/route_demand_dict.json', '/home/suryamurthy/UT_Autonomous_Group/ILASMS_func3a-update-routes/D2MAV_A/route_info_dict.json', 10)
 
 # scenario_file = f'C:\Users\surya\PycharmProjects\ISMS_39\ILASMS_func3a-update-routes\scenarios\generated_scenarios\test_case_0.scn'
 # # scenario_file = r'C:\Users\surya\PycharmProjects\ISMS_39\ILASMS_func3a-update-routes\scenarios\basic_env.scn'

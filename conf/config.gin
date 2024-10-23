@@ -3,20 +3,16 @@
 
 ## ** Driver parameters **
 #  -----------------
-Driver.run_name = 'train_D2MAV_with_noise' ## defines the directory name for saving models and results (ex. models/<run_name>/model.h5)
+Driver.run_name = 'train_D2MAV_noise_aware' ## defines the directory name for saving models and results (ex. models/<run_name>/model.h5)
 Driver.run_type = 'train' # 'train' or 'eval'
-Driver.iterations= 1000
-Driver.num_workers = 1 # of parallel runners
-Driver.scenario_file = 'scenarios/generated_scenarios/austin_env_full_ver_4.scn' # default for final demo; or use scenarios/train
+Driver.iterations= 10000
+Driver.num_workers = 5 # of parallel runners
+Driver.scenario_file = 'scenarios/generated_scenarios/austin_env_full_ver_4_new.scn' # default for final demo; or use scenarios/train
 Driver.config_file = 'settings.cfg' #should not need to modify
-Driver.gui = True # Gui on or off
-
-## For Eval with no traffic manager
-# Driver.weights_file = 'final_demo/models/no_tm/best_model.h5' # used for evaluation
-# Driver.traffic_manager_active = False
+Driver.gui = False # Gui on or off
 
 ## For Eval with traffic manager (make sure to comment out one set)
-Driver.weights_file = None #'models/train_D2MAV/best_model.h5' # used for evaluation
+Driver.weights_file = None #'models/train_D2MAV_noise_only/best_model.h5' # used for evaluation
 Driver.traffic_manager_active = True
 
 
@@ -28,18 +24,18 @@ Driver.speeds = [5,0,60] ## change to [156, 0, 346] for commercial | [0,0,84] fo
 ## State-Termination
 Driver.LOS = 150 # 10 meters from intruder, change to 3 (nm) for commercial
 Driver.dGoal = 500 # 100 meters from goal, change to 5 (nm) for commercial
-Driver.maxRewardDistance = 3000 #1000 # intruders within 100 meters are considered for reward, change to 20 (nm) for commercial
-Driver.intruderThreshold = 6000 #  meters distance to consider intruders in ownship state, change to 50 (nm) for commercial
+Driver.intruderThreshold = 2500 #  meters distance to consider intruders in ownship state, change to 50 (nm) for commercial
 
 
 ## Reward Function
-Driver.n_waypoints = 2
-Driver.rewardBeta = 0.000033
-Driver.rewardAlpha = 0.1
-Driver.speedChangePenalty = 0.001
-Driver.rewardLOS = -1
-Driver.stepPenalty = 0.002
+Driver.altChangePenalty = 0
+Driver.stepPenalty = 0
 Driver.clearancePenalty = 0.001
+
+Driver.weighting_factor_noise = 0.1
+Driver.min_alt = 1000 # feet
+Driver.max_alt = 3000 # feet
+Driver.alt_level_separation = 500 # feet
 ## Non-cooperative 
 Driver.non_coop_tag = 0 # 0 means all are coorperative. 1 means Loss of Control (maintain same speed). 2 means Loss of Communication (Other aircraft cannot see it)
 

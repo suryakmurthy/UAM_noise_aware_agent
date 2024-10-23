@@ -16,7 +16,7 @@ from pyproj import Transformer
 from collections import deque
 
 FILE_PREFIX = ''
-TOWER_CONFIG_FILE = FILE_PREFIX + 'DFW_towers.yaml'
+TOWER_CONFIG_FILE = FILE_PREFIX + 'Austin_towers.yaml'
 BACKGROUND_IMAGE = FILE_PREFIX + 'DFW_intersections.png'
 
 

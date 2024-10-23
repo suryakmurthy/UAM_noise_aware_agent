@@ -18,6 +18,7 @@ import yaml
 from itertools import groupby
 import time
 import json
+import torch
 
 from inspect import currentframe
 from timeit import default_timer as timer
@@ -27,7 +28,7 @@ from D2MAV_A.qatc import TrafficManager, VehicleHelper, load_routes, BadLogic
 
 # Load traffic manager configuration file
 FILE_PREFIX = str(os.path.dirname(__file__))
-TOWER_CONFIG_FILE = FILE_PREFIX + "/DFW_towers.yaml"
+TOWER_CONFIG_FILE = FILE_PREFIX + "/Austin_towers.yaml"
 with open(TOWER_CONFIG_FILE, "r") as f:
     tower_config = yaml.load(f, Loader=yaml.Loader)
 # Load some route data
@@ -41,10 +42,10 @@ with open("new_route_data.pkl", "rb") as file:
     route_data = pickle.load(file)
 
 ## Limit GPU usage
-# import tensorflow as tf
-# gpus = tf.config.experimental.list_physical_devices('GPU')
-# for gpu in gpus:
-#     tf.config.experimental.set_memory_growth(gpu, True)
+import tensorflow as tf
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
 
 
 ## TODO: Move to a different file like "util/" or something similar
@@ -118,12 +119,8 @@ class Runner(object):
         working_directory=None,
         LOS=10,
         dGoal=100,
-        maxRewardDistance=100,
         intruderThreshold=750,
-        rewardBeta=[0.001],
-        rewardAlpha=[0.1],
-        speedChangePenalty=[0.001],
-        rewardLOS=[-1],
+        altChangePenalty=[0],
         stepPenalty=[0],
         clearancePenalty=0.005,
         config_file=None,
@@ -131,7 +128,11 @@ class Runner(object):
         non_coop_tag=0,
         traffic_manager_active=True,
         run_type="train",
-        n_waypoints=2,
+        weighting_factor_noise=0.5,
+        max_alt = 3000,
+        min_alt = 1000,
+        alt_level_separation = 500,
+        n_waypoints=2
     ):
         self.id = actor_id
 
@@ -144,40 +145,32 @@ class Runner(object):
         self.scen_file = scenario_file
         self.working_directory = working_directory
         self.speeds = np.array(speeds)
-        self.altitudes = np.array([-500,0,500])
+        self.altitudes = np.array([-alt_level_separation,0,alt_level_separation])
         self.max_steps = max_steps
         self.simdt = simdt
         self.bsperf = bsperf
         self.step_counter = 0
         self.LOS = LOS
         self.dGoal = dGoal
-        self.maxRewardDistance = maxRewardDistance
         self.intruderThreshold = intruderThreshold
-        self.rewardBeta = rewardBeta
-        self.rewardAlpha = rewardAlpha
-        self.speedChangePenalty = speedChangePenalty
-        self.rewardLOS = rewardLOS
+        self.altChangePenalty = altChangePenalty
         self.stepPenalty = stepPenalty
         self.clearancePenalty = clearancePenalty
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.weighting_factor_noise = weighting_factor_noise
+        with open('grid_points.json', 'r') as json_file:
+            self.grid_points_list = json.load(json_file)
+        self.noise_levels = {}
+
         
         ### Altitude and Noise Reward Parameters
-        self.altChangePenalty = speedChangePenalty
-        self.speed_change_counter = 0
-        self.alt_change_counter = 0
-        self.min_alt = 1000                    # 800
-        self.max_alt = 3000                   # 2500 - 3000
-        self.noise_const_a = -14.3088
-        self.noise_const_b = 103.4767
+        self.min_alt = min_alt                    # feet
+        self.max_alt = max_alt                   # feet
 
-        self.alpha = 0
-        self.beta = 1 - self.alpha
-        self.gamma = 0.01
-        self.safety_train = True
-        self.noise_train = False
         self.alt_changing = {}
-        # print("Noise Reward Params: ", self.alpha, self.beta, self.gamma)
         self.max_noise_increase = 0
-        self.average_noise_increase = []
+        self.average_noise_increase = {}
+        
         self.a_0 = 88.09
         self.a_1 = 3.21
         self.a_2 = -2.62
@@ -190,7 +183,6 @@ class Runner(object):
         self.traffic_manager_active = traffic_manager_active
         self.run_type = run_type
         self.n_waypoints = n_waypoints
-        self.vls_active = False
         self.intersection_radius = 2700
         self.nmac_offset = 3 * 86
         self.nmac_distance = self.LOS + self.nmac_offset
@@ -235,25 +227,16 @@ class Runner(object):
         self.LComm_lst = ["PI30L0"]
 
         # Added Modification for Altitude Adjustments
-        self.speed_only = False
-        if self.speed_only:
-            self.action_dim = 3 # (speed up, ascend), (speed up, maintain) ...
-            self.ownship_obs_dim = 6 + self.n_waypoints * 2
-            self.intruder_obs_dim = 8 + self.n_waypoints * 2
-        else:
-            self.action_dim = 3
-            self.speed_dim = 0 # speed up, maintain, slow down
-            self.alt_dim = 3 # ascend, maintain, descend
-            self.ownship_obs_dim = 4 # + self.n_waypoints * 2
-            self.intruder_obs_dim = 3 # + self.n_waypoints * 2
+        self.action_dim = 3
+        self.speed_dim = 0 # speed up, maintain, slow down
+        self.alt_dim = 3 # ascend, maintain, descend
+        self.ownship_obs_dim = 5 # + self.n_waypoints * 2
+        self.intruder_obs_dim = 3 # + self.n_waypoints * 2
 
         self.action_space = Discrete(self.action_dim)
 
         # Initialize Traffic Manager
         self.create_traffic_manager()
-        if self.speed_only:
-            if self.traffic_manager_active:
-                self.ownship_obs_dim += 2
 
         if self.gui:
             self.bs.init(
@@ -267,10 +250,12 @@ class Runner(object):
                 detached=True,
                 configfile=self.working_directory + "/" + config_file,
             )
-
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Checking Availablilty Runner: ", self.device)
         self.agent.initialize(
-            self.tf, self.ownship_obs_dim, self.intruder_obs_dim, self.action_dim
+            tf, self.ownship_obs_dim, self.intruder_obs_dim, self.action_dim
         )
+
 
     def create_traffic_manager(self):
         route_linestrings = {}
@@ -297,7 +282,7 @@ class Runner(object):
         """
         Beginning of the episode. In this function, all variables need to be reset to default.
         """
-
+        print("Resetting")
         self.agent.reset()
 
         self.timer = 0
@@ -310,6 +295,7 @@ class Runner(object):
         self.acInfo = {}
         self.file_keeper = []
         collected_responses = {}
+        self.congestion_distribution = {}
 
         # randomly sample
         if ".scn" not in self.scen_file:
@@ -329,69 +315,22 @@ class Runner(object):
         self.bs.stack.stack("FF")
         self.bs.sim.step()  # bs.sim.simt = 0.0 AFTER the call to bs.sim.step()
         self.bs.stack.stack("FF")
-        if self.speed_only:
-            ownship_min_state = [0, self.tas_min, self.ax_min, 0, 0, 0]
-            ownship_max_state = [self.max_d, self.tas_max, self.ax_max, 360, self.max_d, 2]
 
-            intruder_min_state = [
-                self.min_x - self.max_x,
-                self.min_y - self.max_y,
-                0,
-                self.tas_min,
-                self.ax_min,
-                0,
-                0,
-                0,
-            ]
+        # Adding Altitude State information (Current Alt, Ambient Noise) to end of state
+        ownship_min_state = [0, 0, 40, 0, 0]
+        ownship_max_state = [2, self.max_alt, 60, 1, self.max_alt]
 
-            intruder_max_state = [
-                self.max_x - self.min_x,
-                self.max_y - self.min_y,
-                self.max_d,
-                self.tas_max,
-                self.ax_max,
-                360,
-                self.max_d,
-                2,
-            ]
-        else:
-            # Adding Altitude State information (Current Alt, Ambient Noise) to end of state
-            ownship_min_state = [0, 0, 40, 0]
-            ownship_max_state = [2, self.max_alt, 60, 1]
+        intruder_min_state = [
+            0,
+            0,
+            -self.max_alt
+        ]
 
-            intruder_min_state = [
-                # self.min_x - self.max_x,
-                # self.min_y - self.max_y,
-                # 0,
-                # self.tas_min,
-                # self.ax_min,
-                # 0,
-                0,
-                0,
-                0
-            ]
-
-            intruder_max_state = [
-                # self.max_x - self.min_x,
-                # self.max_y - self.min_y,
-                # self.max_d,
-                # self.tas_max,
-                # self.ax_max,
-                # 360,
-                self.max_d,
-                2,
-                self.max_alt
-            ]
-
-        # clearance denied, cleared, no clearance request
-        if self.speed_only:
-            if self.traffic_manager_active:
-                ownship_min_state += [0, 0]
-                ownship_max_state += [2, self.max_d]
-            ownship_min_state += [-180, 0] * self.n_waypoints
-            ownship_max_state += [180, self.max_d] * self.n_waypoints
-            intruder_min_state += [-180, 0] * self.n_waypoints
-            intruder_max_state += [180, self.max_d] * self.n_waypoints
+        intruder_max_state = [
+            self.max_d,
+            2,
+            self.max_alt
+        ]
 
         ## rel utm position, dist goal, speed, acceleration, heading, distance ownship to intruder, distance intruder intersection, distance ownship to intersection
         self.context_space = Box(
@@ -494,99 +433,22 @@ class Runner(object):
                     speed = 40
                 self.bs.stack.stack("{} SPD {}".format(ac_id, speed))
                 continue
-            if self.speed_only:
-                speed = self.speeds[actions[ac_id]]
-                new_alt = 1000
-                if actions[ac_id] == 1:  # hold
-                    # Convert current speed in m/s to knots
-                    speed = int(
-                        np.round(
-                            (self.bs.traf.cas[self.bs.traf.id2idx(ac_id)] / geo.nm) * 3600
-                        )
-                    )
-            else:
-                speed = self.speeds[2]
-                # print("Calculated Speed: ", ac_id, actions[ac_id], self.speeds[int(actions[ac_id] / 3)])
-                alt_change = self.altitudes[actions[ac_id]]
-                current_alt = self.meters_to_feet(self.bs.traf.alt[self.bs.traf.id2idx(ac_id)])
-                new_alt = current_alt + alt_change
-                if int(actions[ac_id] / 3) == 1:  # hold
-                    # Convert current speed in m/s to knots
-                    speed = int(
-                        np.round(
-                            (self.bs.traf.cas[self.bs.traf.id2idx(ac_id)] / geo.nm) * 3600
-                        )
-                    )
-            if self.vls_active:
-                n_ac = self.bs.traf.lat.shape[0]
-                d = (
-                geo.kwikdist_matrix(
-                    np.repeat(self.bs.traf.lat, n_ac),
-                    np.repeat(self.bs.traf.lon, n_ac),
-                    np.tile(self.bs.traf.lat, n_ac),
-                    np.tile(self.bs.traf.lon, n_ac),
-                ).reshape(n_ac, n_ac)
-                * geo.nm)
-                nmac_flag = False
-                # print("Checking if Shielding is nessesary: ", ac_id, self.vehicle_helpers[ac_id].within_intersection)
-                if not self.vehicle_helpers[ac_id].within_intersection:
-                    for other_id in self.bs.traf.id:
-                        if ac_id == other_id:
-                            continue
-                        i_idx = self.bs.traf.id2idx(ac_id)
-                        j_idx = self.bs.traf.id2idx(other_id)
-                        if d[i_idx][j_idx] > self.intersection_radius:
-                            continue
 
-                        # Same Route Shielding Logic
-                        route_i = self.bs.traf.ap.route[i_idx]
-                        route_j = self.bs.traf.ap.route[j_idx]
-                        next_wp_i = route_i.wpname[route_i.iactwp]
-                        next_wp_j = route_j.wpname[route_j.iactwp]
-                        next_wp_i_2 = None
-                        next_wp_j_2 = None
-                        if route_i.iactwp != len(route_i.wpname) - 1:
-                            next_wp_i_2 = route_i.wpname[route_i.iactwp + 1]
-                        if route_j.iactwp != len(route_j.wpname) - 1:
-                            next_wp_j_2 = route_j.wpname[route_j.iactwp + 1]
-
-                        if self.bs.traf.active[i_idx] and self.bs.traf.active[j_idx]:
-                            if next_wp_j == next_wp_i:
-                                dist_i = self.bs.traf.ap.dist2wp[i_idx] 
-                                dist_j = self.bs.traf.ap.dist2wp[j_idx] 
-                                
-                                if dist_i != -1 and dist_j != -1 and dist_j < dist_i: #self.bs.traf.distflown[i_idx] < self.bs.traf.distflown[j_idx]:
-                                    if d[i_idx][j_idx] < self.nmac_distance:
-                                        if self.bs.traf.tas[j_idx] == 0:
-                                            self.action_override.append(ac_id)
-                                        else:
-                                            if d[i_idx][j_idx] < self.LOS:
-                                                self.action_override.append(ac_id)
-                                            else:
-                                                speed = self.speeds[0]
-                            
-                            if  next_wp_i_2 != None and (next_wp_i_2 == next_wp_j):
-                                if d[i_idx][j_idx] < self.nmac_distance:
-                                    if self.bs.traf.tas[j_idx] == 0:
-                                        self.action_override.append(ac_id)
-                                    else:
-                                        if d[i_idx][j_idx] < self.LOS:
-                                            self.action_override.append(ac_id)
-                                        else:
-                                            speed = self.speeds[0]
-                            
-                            if ac_id[1:5] == other_id[1:5]:
-                                if self.bs.traf.distflown[i_idx] < self.bs.traf.distflown[j_idx]:
-                                    if d[i_idx][j_idx] < self.nmac_distance:
-                                        if self.bs.traf.tas[j_idx] == 0:
-                                            self.action_override.append(ac_id)
-                                        else:
-                                            if d[i_idx][j_idx] < self.LOS:
-                                                self.action_override.append(ac_id)
-                                            else:
-                                                speed = self.speeds[0]
+            speed = self.speeds[2]
+            # print("Calculated Speed: ", ac_id, actions[ac_id], self.speeds[int(actions[ac_id] / 3)])
+            alt_change = self.altitudes[actions[ac_id]]
+            # print("Aircraft Action: ", alt_change)
+            current_alt = self.meters_to_feet(self.bs.traf.alt[self.bs.traf.id2idx(ac_id)])
+            new_alt = current_alt + alt_change
+            if int(actions[ac_id] / 3) == 1:  # hold
+                # Convert current speed in m/s to knots
+                speed = int(
+                    np.round(
+                        (self.bs.traf.cas[self.bs.traf.id2idx(ac_id)] / geo.nm) * 3600
+                    )
+                )
             if ac_id in self.action_override:
-                print("Overriding action for ", ac_id, self.vls_active)
+                print("Overriding action for ", ac_id)
                 speed = 0
             # print("Speed Command: ", "{} SPD {}".format(ac_id, speed))
             self.bs.stack.stack("{} SPD {}".format(ac_id, speed))
@@ -618,9 +480,10 @@ class Runner(object):
 
         for ac_id in list(self.alt_changing.keys()):
             idx = self.bs.traf.id2idx(ac_id)
-            if self.alt_changing[ac_id] == round(self.meters_to_feet(self.bs.traf.alt[idx])):
-                # print("Removing ", ac_id, self.alt_changing)
-                del self.alt_changing[ac_id]
+            if idx != -1:
+                if self.alt_changing[ac_id] == round(self.meters_to_feet(self.bs.traf.alt[idx])):
+                    # print("Removing ", ac_id, self.alt_changing)
+                    del self.alt_changing[ac_id]
         
         ### Start of traffic manager code ###
         if self.traffic_manager_active:
@@ -651,12 +514,6 @@ class Runner(object):
                     continue
 
                 curr_gps = [self.bs.traf.lon[i], self.bs.traf.lat[i]]
-                # if id_ == "PPPDT12":
-                #     for intersection in self.traffic_manager.intersections.values():
-                #         if self.traffic_manager.check_if_within_intersection(
-                #                 curr_gps, intersection.tower_ID
-                #         ):
-                #             print("In Intersection: ", intersection.tower_ID)
                 # Determine which vehicles are inside which intersections
                 for intersection in self.traffic_manager.intersections.values():
                     if self.traffic_manager.check_if_within_intersection(
@@ -764,19 +621,7 @@ class Runner(object):
                             self.vehicle_helpers[
                                 id_
                             ].enter_request_status = False  # reset
-                            # Remove id from shielding for the appropriate intersection
-                            # for alt_key in intersection.alt_levels.keys():
-                            #     if id_ in intersection.alt_levels[alt_key]:
-                            #         intersection.alt_levels[alt_key].remove(id_)
-                            """ THE FOLLOWING IF STATEMENT SHOULD BE REMOVABLE """
-                            # nrs = self.vehicle_helpers[
-                            #     id_
-                            # ].next_route_section  # Will be None if exiting the system
-                            # if nrs:
-                            #     self.traffic_manager.towers[nrs].accepted.append(id_)
-                            #     self.traffic_manager.towers[nrs].authorized.remove(id_)
-                            #     self.vehicle_helpers[id_].change_route_section()
-                            # break
+
                             if id_ == 'PPPDT12':
                                 print("Aircraft Accepted: ", id_, intersection.tower_ID)
                             if current_route_section:
@@ -1029,6 +874,60 @@ class Runner(object):
         #     ]
         # )
 
+        avg_noise_vals = {}
+        noise_vals = {}
+        for id_val in self.bs.traf.id:
+            idx_val = self.bs.traf.id2idx(id_val)
+            ac_alt = self.meters_to_feet(self.bs.traf.alt[idx_val])
+            
+            if ac_alt <= self.min_alt:
+                ac_noise = 0
+            else:
+                ac_noise = self.a_0 +  (self.a_1 * math.log10(ac_alt)) + (self.a_2 * ((math.log10(ac_alt))**2))
+            if self.vehicle_helpers[id_val].current_route_section != None:
+                if self.vehicle_helpers[id_val].current_route_section not in noise_vals.keys():
+                    noise_vals[self.vehicle_helpers[id_val].current_route_section] = []
+                noise_vals[self.vehicle_helpers[id_val].current_route_section].append(10**(ac_noise / 10))
+            if self.vehicle_helpers[id_val].current_intersection != None:
+                if self.vehicle_helpers[id_val].current_intersection not in noise_vals.keys():
+                    noise_vals[self.vehicle_helpers[id_val].current_intersection] = []
+                noise_vals[self.vehicle_helpers[id_val].current_intersection].append(10**(ac_noise / 10))
+        # print("Noise Values: ", noise_vals)
+        for route_id in noise_vals.keys():
+            if np.sum(noise_vals[route_id]) == 0:
+                total_noise_impact = 0
+                noise_increase = 0
+            else:
+                total_noise_impact = 10 * math.log10(np.sum(noise_vals[route_id]))
+                if route_id not in self.ambient_noise_level.keys():
+                    ambient_noise_val = 40
+                else:
+                    ambient_noise_val = self.ambient_noise_level[route_id]
+                noise_increase = total_noise_impact - ambient_noise_val
+            if noise_increase < 0:
+                noise_increase = 0
+            if noise_increase != 0:
+                if route_id not in self.average_noise_increase.keys():
+                    self.average_noise_increase[route_id] = []
+                self.average_noise_increase[route_id].append(noise_increase)
+                avg_noise_vals[route_id] = noise_increase
+            if noise_increase >= self.max_noise_increase:
+                self.max_noise_increase = noise_increase
+
+        for id_val in self.bs.traf.id:
+            idx_val = self.bs.traf.id2idx(id_val)
+            if id_val in self.alt_changing:
+                ac_alt = self.alt_changing[id_val]
+            else:
+                ac_alt = round(self.meters_to_feet(self.bs.traf.alt[idx_val]))
+            if ac_alt not in self.congestion_distribution.keys():
+                self.congestion_distribution[ac_alt] = 0
+            else:
+                self.congestion_distribution[ac_alt] += 1
+            
+            
+            
+
         # looping over the ownships
         for i in range(d.shape[0]):
             # ownship ID
@@ -1091,9 +990,8 @@ class Runner(object):
             if a is not None:
                 if id_ in a:
                     prev_action_own = a[id_]
-
             rew[id_] = 0
-
+            # print("Start of Reward Calculation", id_, rew[id_])
             if self.traffic_manager_active:
                 # TODO: The following check will not work for vehicles that exist but arent currently requesting.
                 # TODO: tm_response is only populated with vehicles that are requesting
@@ -1114,8 +1012,6 @@ class Runner(object):
                     # TODO: Store a flag of the vehicle that needs to be overwritten
                     # print(distance, response, id_, traf.active[i])
                     if distance != -1 and distance < 250 and response == 0:
-                        # print(traf.cas[i])
-                        # self.bs.stack.stack(f"SPD {id_} 0")
                         rew[id_] += -10 * self.clearancePenalty
                         self.action_override.append(id_)
                 else:
@@ -1123,95 +1019,60 @@ class Runner(object):
                     distance = 0
 
                 # TODO: Set a dist value that indicates the vehicle is not requesting
-                if self.speed_only:
-                    own_state = [
-                        dist,
-                        traf.cas[i],
-                        traf.ax[i],
-                        traf.hdg[i],
-                        self.LOS,
-                        prev_action_own,
-                        response,
-                        distance,
-                    ]
+                # Calculate Ambient Noise
+                ambient_noise = 40
+                current_route_section_name = self.vehicle_helpers[id_].current_route_section
+                current_intersection_name = self.vehicle_helpers[id_].current_intersection
+                if current_route_section_name != None and current_route_section_name in self.ambient_noise_level.keys():
+                    ambient_noise = self.ambient_noise_level[current_route_section_name]
                 else:
-                    # Calculate Ambient Noise
-                    ambient_noise = 40
-                    current_route_section_name = self.vehicle_helpers[id_].current_route_section
-                    current_intersection_name = self.vehicle_helpers[id_].current_intersection
-                    if current_route_section_name != None and current_route_section_name in self.ambient_noise_level.keys():
-                        ambient_noise = self.ambient_noise_level[current_route_section_name]
-                    else:
-                        if current_intersection_name != None and current_intersection_name in self.ambient_noise_level.keys():
-                            ambient_noise = self.ambient_noise_level[current_intersection_name]
-                    if id_ in self.alt_changing.keys():
-                        alt_changing_bool = 1
-                    else:
-                        alt_changing_bool = 0
-                    own_state = [
-                        # dist,
-                        # traf.cas[i],
-                        # traf.ax[i],
-                        # traf.hdg[i],
-                        # self.LOS,
-                        prev_action_own,
-                        traf.alt[i],
-                        ambient_noise,
-                        alt_changing_bool,
-                        # response,
-                        # distance,
-                    ]
-
+                    if current_intersection_name != None and current_intersection_name in self.ambient_noise_level.keys():
+                        ambient_noise = self.ambient_noise_level[current_intersection_name]
+                if id_ in self.alt_changing.keys():
+                    alt_changing_bool = 1
+                    target_alt = self.alt_changing[id_]
+                else:
+                    alt_changing_bool = 0
+                    target_alt = self.meters_to_feet(traf.alt[i])
+                own_state = [
+                    # dist,
+                    # traf.cas[i],
+                    # traf.ax[i],
+                    # traf.hdg[i],
+                    # self.LOS,
+                    prev_action_own,
+                    self.meters_to_feet(traf.alt[i]),
+                    ambient_noise,
+                    alt_changing_bool,
+                    target_alt
+                    # response,
+                    # distance,
+                ]
+            
             else:
-                if self.speed_only:
-                    own_state = [
-                        dist,
-                        traf.cas[i],
-                        traf.ax[i],
-                        traf.hdg[i],
-                        self.LOS,
-                        prev_action_own,
-                    ]
+                ambient_noise = 40
+                current_route_section_name = self.vehicle_helpers[id_].current_route_section
+                current_intersection_name = self.vehicle_helpers[id_].current_intersection
+                if current_route_section_name != None and current_route_section_name in self.ambient_noise_level.keys():
+                    ambient_noise = self.ambient_noise_level[current_route_section_name]
                 else:
-                    ambient_noise = 40
-                    current_route_section_name = self.vehicle_helpers[id_].current_route_section
-                    current_intersection_name = self.vehicle_helpers[id_].current_intersection
-                    if current_route_section_name != None and current_route_section_name in self.ambient_noise_level.keys():
-                        ambient_noise = self.ambient_noise_level[current_route_section_name]
-                    else:
-                        if current_intersection_name != None and current_intersection_name in self.ambient_noise_level.keys():
-                            ambient_noise = self.ambient_noise_level[current_intersection_name]
-                    if id_ in self.alt_changing.keys():
-                        alt_changing_bool = 1
-                    else:
-                        alt_changing_bool = 0
-                    own_state = [
-                        # dist,
-                        # traf.cas[i],
-                        # traf.ax[i],
-                        # traf.hdg[i],
-                        # self.LOS,
-                        prev_action_own,
-                        traf.alt[i],
-                        ambient_noise,
-                        alt_changing_bool
-                    ]
-            if self.speed_only:
-                own_state += rel_waypoints
-
+                    if current_intersection_name != None and current_intersection_name in self.ambient_noise_level.keys():
+                        ambient_noise = self.ambient_noise_level[current_intersection_name]
+                if id_ in self.alt_changing.keys():
+                    alt_changing_bool = 1
+                    target_alt = self.alt_changing[id_]
+                else:
+                    alt_changing_bool = 0
+                    target_alt = self.meters_to_feet(traf.alt[i])
+                own_state = [
+                    prev_action_own,
+                    self.meters_to_feet(traf.alt[i]),
+                    ambient_noise,
+                    alt_changing_bool,
+                    target_alt
+                ]
+            # print("Checkpoint 2", id_, rew[id_])
             own_state = np.array(own_state).reshape(1, self.observation_space.shape[0])
-            # print("Own State Example: ", id_, own_state)
-            #  np.array(
-            #         [
-            #             dist,
-            #             traf.cas[i],
-            #             traf.ax[i],
-            #             traf.hdg[i],
-            #             self.LOS,
-            #             prev_action_own,
-            #         ]
-            #     ).reshape(1, self.observation_space.shape[0])
-
             ## check normalization values
             self.normalization_check(x=xEast_own, y=yNorth_own, d=dist)
 
@@ -1235,17 +1096,8 @@ class Runner(object):
             done[id_] = False
             info[id_] = None
 
-            # if self.traffic_manager_active:
-            #     if id_ in self.exiting_vehicles:
-            #         done[id_] = True
-            # else:
             ## made it to the goal
             if dist < self.dGoal:
-                # if self.traffic_manager_active:
-                #    if id_ in self.exiting_vehicles:
-                #        done[id_] = True
-                #
-                # else:
 
                 if self.traffic_manager_active:
                     intersection = self.vehicle_helpers[id_].current_intersection
@@ -1270,9 +1122,15 @@ class Runner(object):
             intruder_state = None
             # Noise Information
             alt_own = self.bs.traf.alt[i]
+            alt_own_rew = self.bs.traf.alt[i]
             alt_own_ft = self.meters_to_feet(alt_own)
-            intruder_noise_vals = {} 
-
+            # if id_ in self.alt_changing.keys():
+            #     alt_own_rew = self.alt_changing[id_]
+            intruder_noise_vals = {}
+            same_alt_level = 0
+            same_alt_list = []
+            diff_alt_level = 0
+            diff_alt_list = []
             for j in range(len(argsort[i])):
                 index = int(argsort[i][j])
                 id_j = self.bs.traf.id[index]
@@ -1284,18 +1142,17 @@ class Runner(object):
                     continue
                 ## ALT Information
 
+                
 
                 alt_intruder = self.bs.traf.alt[index]
+                alt_intruder_rew = self.bs.traf.alt[index]
+                # if id_j in self.alt_changing.keys():
+                #     alt_intruder_rew = self.alt_changing[id_j]
                 alt_intruder_ft = self.meters_to_feet(alt_intruder)
                 id_j = self.bs.traf.id[index]
                 dist_with_alt = np.sqrt((d[i, index]**2) + ((alt_own - alt_intruder)**2)) # Replace d[i, index] with this value
                 
 
-
-                # -1 index so that it is the true goal location even with multiple waypoints
-                # glat, glon = traf.ap.route[index].wplat[-1], traf.ap.route[index].wplon[-1]
-                # dist = geo.latlondist(traf.lat[index],traf.lon[index],glat,glon) # meters
-                # dist = geo.kwikdist(traf.lat[index], traf.lon[index], glat, glon) * geo.nm
                 intruder_obj = geometries.geoms[index]
                 dist = intruder_obj.length
                 # intruder to be removed
@@ -1309,41 +1166,45 @@ class Runner(object):
                     continue
 
                 if alt_intruder > 0:
-                    # print("Checking Altitude: ", alt_intruder, alt_intruder_ft)
                     intruder_noise_vals[index] = self.a_0 +  (self.a_1 * math.log10(alt_intruder_ft)) + (self.a_2 * ((math.log10(alt_intruder_ft))**2))
                 else:
                     intruder_noise_vals[index] = 0
 
-                # if the ownship and intruder do not intersect and they are not on the same route
+                    
+                # Check if Aircraft are on Parallel Routes
                 if not ownship_obj.intersects(intruder_obj):
                     continue
+                
 
                 if self.vehicle_helpers[id_].current_route_section != None and self.vehicle_helpers[id_j].current_route_section != None:
                     swapped_route = self.vehicle_helpers[id_].current_route_section[2:4] + self.vehicle_helpers[id_].current_route_section[0:2]
                     if swapped_route == self.vehicle_helpers[id_j].current_route_section:
                         continue
+                
+                # Check if aircraft are on the same route
+                if self.vehicle_helpers[id_].current_route_section != None and self.vehicle_helpers[id_j].current_route_section != None:
+                    if self.vehicle_helpers[id_].current_route_section == self.vehicle_helpers[id_j].current_route_section:
+                        continue
 
                 ## At this point. The intruder is only considered if the routes intersect
-                ## Now I need to take care of tracks on the same route/lane
+                if self.meters_to_feet(alt_own) >= self.min_alt:
+                    dist_between_ac = d[i, index]
+                    if np.abs(alt_own_rew - alt_intruder_rew) < self.LOS:
+                        same_alt_level += 1
+                        same_alt_list.append(id_j)
+                    else:
+                        if dist_between_ac < self.LOS:
+                            diff_alt_level += 1
+                        else:
+                            diff_alt_level += 1 - ((dist_between_ac - self.LOS) / (self.intruderThreshold - self.LOS))
+                        diff_alt_list.append(id_j)
 
-                # ilon, ilat = list(ownship_obj.intersection(intruder_obj).coords)[0]
-                #
-                # dist_int_inter = geo.kwikdist(traf.lat[index], traf.lon[index], ilat, ilon)  # nautical miles
-                # dist_own_inter = geo.kwikdist(traf.lat[i], traf.lon[i], ilat, ilon)  # nautical miles
-                # print("Checking: ", id_, index, d[i, index], a)
-                if self.speed_only:
-                    if d[i, index] < self.LOS and not reward_count and a != None:
-                        rew[id_] += self.rewardLOS
-                        reward_count = True
-                        info[id_] = 1
-                        if id_ in a:
-                            self.acInfo[id_]["NMAC"][-1] = 1
-                
-                    if not reward_count:
-                        if d[i, index] < self.maxRewardDistance and d[i, index] > self.LOS:
-                            rew[id_] += -self.rewardAlpha + self.rewardBeta * (d[i, index])
-                            reward_count = True
-                
+
+                if dist_with_alt < self.LOS:
+                    info[id_] = 1
+                    if id_ in a:
+                        self.acInfo[id_]["NMAC"][-1] = 1
+                # print("Checkpoint 3", id_, rew[id_])
                 ## Converting intruder lat/lon to UTM coords
                 xEast_int, yNorth_int = (
                     coord_transform[0][index],
@@ -1384,36 +1245,21 @@ class Runner(object):
                         self.n_waypoints - len(remaining_waypoints)
                     )
                 # print("Example of Rel Waypoints: ", id_, id_j, rel_waypoints)
-                if self.speed_only:
-                    int_state = np.array(
-                        [
-                            relX,
-                            relY,
-                            distIntGoal,
-                            traf.cas[index],
-                            traf.ax[index],
-                            traf.hdg[index],
-                            d[i, index],
-                            prev_action_int,
-
-                        ]
-                        + rel_waypoints
-                    ).reshape(1, self.context_space.shape[0])
-                else:
-                    int_state = np.array(
-                        [
-                            # relX,
-                            # relY,
-                            # distIntGoal,
-                            # traf.cas[index],
-                            # traf.ax[index],
-                            # traf.hdg[index],
-                            d[i, index],
-                            prev_action_int,
-                            traf.alt[index],
-                        ]
-                        # + rel_waypoints
-                    ).reshape(1, self.context_space.shape[0])
+                rel_altitude = alt_own_ft - alt_intruder_ft
+                int_state = np.array(
+                    [
+                        # relX,
+                        # relY,
+                        # distIntGoal,
+                        # traf.cas[index],
+                        # traf.ax[index],
+                        # traf.hdg[index],
+                        d[i, index],
+                        prev_action_int,
+                        rel_altitude, # Changing from actual altitude to relavtive altitude
+                    ]
+                    # + rel_waypoints
+                ).reshape(1, self.context_space.shape[0])
                 # print("Intruder State Example: ", id_j, int_state)
                 self.normalization_check(x=xEast_int, y=yNorth_int, d=distIntGoal)
 
@@ -1431,7 +1277,7 @@ class Runner(object):
 
                 if closest_count == 0:
                     break
-
+            
             if closest_count != 0:
                 remaining = np.zeros((closest_count, self.intruder_obs_dim))
                 if intruder_state is None:
@@ -1458,66 +1304,65 @@ class Runner(object):
 
             ### NOISE REWARD IMPLEMENTATION ###
             ## 1: Single Event Noise Calculation
-            if not self.speed_only:
-                next_route_section_name = self.vehicle_helpers[id_].next_route_section
-                current_route_section_name = self.vehicle_helpers[id_].current_route_section
-                current_intersection_name = self.vehicle_helpers[id_].current_intersection
-                ambient_noise = 40
-                if current_route_section_name != None and current_route_section_name in self.ambient_noise_level.keys():
-                    ambient_noise = self.ambient_noise_level[current_route_section_name]
-                else:
-                    if current_intersection_name != None and current_intersection_name in self.ambient_noise_level.keys():
-                        ambient_noise = self.ambient_noise_level[current_intersection_name]
-                if alt_own > 0:
-                    current_aircraft_noise = self.a_0 +  (self.a_1 * math.log10(alt_own_ft)) + (self.a_2 * ((math.log10(alt_own_ft))**2))
-                    # current_aircraft_noise = (self.noise_const_a * math.log(alt_own)) + self.noise_const_b
-                else:
-                    current_aircraft_noise = 0
-                ## 2: Group Event Noise
-                # inner_log_val = (10**(ambient_noise / 10))
-                inner_log_val = 0 # (10**(current_aircraft_noise / 10))
-                for single_noise_val in intruder_noise_vals.values():
-                    inner_log_val += (10**(single_noise_val / 10))
-                if inner_log_val != 0:
-                    total_noise_impact = 10 * math.log10(inner_log_val)
-                else:
-                    total_noise_impact = 0
-                # This is a test to see if this is a viable reward formulation
-                # total_noise_factored = current_aircraft_noise - total_noise_impact
+            next_route_section_name = self.vehicle_helpers[id_].next_route_section
+            current_route_section_name = self.vehicle_helpers[id_].current_route_section
+            current_intersection_name = self.vehicle_helpers[id_].current_intersection
+            ambient_noise = 40
+            if current_route_section_name != None and current_route_section_name in self.ambient_noise_level.keys():
+                ambient_noise = self.ambient_noise_level[current_route_section_name]
+            else:
+                if current_intersection_name != None and current_intersection_name in self.ambient_noise_level.keys():
+                    ambient_noise = self.ambient_noise_level[current_intersection_name]
+            if alt_own > 0:
+                current_aircraft_noise = self.a_0 +  (self.a_1 * math.log10(alt_own_ft)) + (self.a_2 * ((math.log10(alt_own_ft))**2))
+            else:
+                current_aircraft_noise = 0
 
-                ## Old Version:
-                total_noise_factored_own = current_aircraft_noise - ambient_noise
-                best_case_noise = self.a_0 +  (self.a_1 * math.log10(self.max_alt)) + (self.a_2 * ((math.log10(self.max_alt))**2))
-                worst_case_noise = self.a_0 +  (self.a_1 * math.log10(0.1)) + (self.a_2 * ((math.log10(0.1))**2))
-                best_case_noise_increase = best_case_noise - ambient_noise
-                worst_case_noise_increase = worst_case_noise - ambient_noise
-                noise_increase_over_best_case = total_noise_factored_own # - best_case_noise_increase
-                noise_increase_normalized = (total_noise_factored_own - best_case_noise_increase) / (worst_case_noise_increase - best_case_noise_increase)
-                total_noise_factored_int = (ambient_noise - current_aircraft_noise - (10 * math.log10(10**((total_noise_impact - current_aircraft_noise)/10)+1)))
-                # Ambient noise needs to be included
-                # Total noise is around ~ -26per time step. Max negative reward per time step is 
-                total_noise_factored = (self.alpha * noise_increase_over_best_case) + (self.beta * total_noise_factored_int)
-                if total_noise_factored >= 0:
-                    total_noise_factored = 0
-                # print("Ambient Noise values: ", alt_own_ft, total_noise_factored_own, best_case_noise_increase, worst_case_noise_increase)
-                # print("Noise reward: ", noise_increase_normalized, total_noise_factored, self.gamma)
-                rew[id_] -= noise_increase_normalized
-            if self.speed_only:
-                if not init and not done[id_]:
-                    if a is not None:
-                        if id_ in a.keys():
-                            if a[id_] == 0 or a[id_] == 2:
-                                rew[id_] += -self.speedChangePenalty
-                            rew[id_] += -self.stepPenalty  ## step penalty
-                            # print("Energy reward: ", self.speedChangePenalty, self.stepPenalty)
+            ## 2: Group Event Noise
+            inner_log_val = 0 # (10**(current_aircraft_noise / 10))
+            for single_noise_val in intruder_noise_vals.values():
+                inner_log_val += (10**(single_noise_val / 10))
+            if inner_log_val != 0:
+                total_noise_impact = 10 * math.log10(inner_log_val)
+            else:
+                total_noise_impact = 0
 
+            ## Noise Reward Function
+            total_noise_factored_own = current_aircraft_noise - ambient_noise
+            best_case_noise = self.a_0 +  (self.a_1 * math.log10(self.max_alt)) + (self.a_2 * ((math.log10(self.max_alt))**2))
+            worst_case_noise = self.a_0 +  (self.a_1 * math.log10(0.1)) + (self.a_2 * ((math.log10(0.1))**2))
+            best_case_noise_increase = best_case_noise - ambient_noise
+            worst_case_noise_increase = worst_case_noise - ambient_noise
+            noise_increase_over_best_case = total_noise_factored_own # - best_case_noise_increase
+            noise_increase_normalized = (total_noise_factored_own - best_case_noise_increase) / (worst_case_noise_increase - best_case_noise_increase)
+            total_noise_factored_int = (ambient_noise - current_aircraft_noise - (10 * math.log10(10**((total_noise_impact - current_aircraft_noise)/10)+1)))
+            # Ambient noise needs to be included
+
+            # Total noise is around ~ -26per time step. Max negative reward per time step is 
+            total_noise_factored = noise_increase_over_best_case
+            if total_noise_factored >= 0:
+                total_noise_factored = 0
+
+            rew[id_] -= self.weighting_factor_noise * noise_increase_normalized
+            ### Congestion Management
+            max_aircraft_at_same_altitude = 10
+            congestion_penalty = -1 * min(same_alt_level / max_aircraft_at_same_altitude, 1)
+            rew[id_] += (1 - self.weighting_factor_noise) * (congestion_penalty)
+            
+            
+            if not init and not done[id_]:
+                if a is not None:
+                    if id_ in a.keys():
+                        if a[id_] == 0 or a[id_] == 2:
+                            rew[id_] += -self.altChangePenalty
+                        rew[id_] += -self.stepPenalty  ## step penalty
         return state, rew, done, info
 
     def run_one_iteration(self, weights):
         """
         2022/11/1 modify the policy implementation and introduce the non-cooperative behaviors
         """
-
+        # print("Checking for error here 0")
         if self.agent.equipped:
             self.agent.model.set_weights(weights)
         # self.agent.data = {}
@@ -1559,19 +1404,20 @@ class Runner(object):
                     self.step_counter = 0
 
                 #     # Need to process remaining entries in self.memory to self.data
+                # print("Checking for error here")
                 for id_ in self.agent.memory.keys():
                     # if the id_ has already been processed then skip it
                     if id_ in self.agent.data.keys():
                         continue
                     self.agent.process_memory(id_)
-
+                # print("Checking for error here 2")
                 # # TODO: is this necessary?
                 for key in self.agent.data.keys():
                     if type(self.agent.data[key]) == list:
                         self.agent.data[key] = np.concatenate(
                             self.agent.data[key], axis=0
                         )
-
+                # print("Checking for error here 3")
                 self.agent.data["nmacs"] = self.nmacs
                 self.agent.data["nmac_time"] = self.nmac_time
                 self.agent.data["total_ac"] = self.total_ac
@@ -1585,35 +1431,13 @@ class Runner(object):
 
                 if not "raw_reward" in self.agent.data:
                     self.agent.data["raw_reward"] = np.array([0.0])
-
+                self.agent.data["max_noise_increase"] = self.max_noise_increase
+                self.agent.data["avg_noise_increase"] = self.average_noise_increase
+                self.agent.data["congestion_distribution"] = self.congestion_distribution
                 self.agent.data["environment_done"] = self.episode_done
                 data_ID = ray.put([self.agent.data, self.id])
-
+                # print("Checking for error here 4")
                 return data_ID
-
-            # if self.step_counter >= self.max_steps:
-
-            #     self.last_obs = next_obs
-
-            #     # Need to process remaining entries in self.memory to self.data
-            #     for id_ in self.memory.keys():
-
-            #         # if the id_ has already been processed then skip it
-            #         if id_ in self.data.keys():
-            #             continue
-
-            #         self.process_memory(id_)
-
-            #     # convert to array from list of arrays
-            #     for model in self.data.keys():
-            #         for key in self.data[model].keys():
-            #             if type(self.data[model][key]) == list:
-            #                 self.data[model][key] = np.concatenate(self.data[model][key], axis=0)
-
-            #     self.data_ID = ray.put([self.data, self.id])
-            #     del self.data
-
-            #     return self.data_ID  # self.data, self.id
 
     def store_data(self, obs, action, rew, next_obs, term, term_type, policy, value):
         obs_updated = copy(next_obs)
@@ -1636,18 +1460,6 @@ class Runner(object):
                     )
                     self.nmacs += sum(group)
                 self.bs.stack.stack("DEL {}".format(ac_id))
-                # TODO: MIGHT NEED TO REMOVE VEHICLES HERE....
-                # if ac_id in self.exiting_vehicles: # TODO: NOT SUSTAINABLE. THIS WILL RESULT IN AIRSPACE VOLUME NEVER BEING REDUCED
-
-                # if self.traffic_manager_active:
-
-                # if self.traffic_manager_active:
-
-                #     try: # ?????
-                #         self.exiting_vehicles.remove(ac_id)
-
-                #     except:
-                #         import ipdb;ipdb.set_trace()
                 del obs_updated[ac_id]
 
         return obs_updated
@@ -1703,69 +1515,35 @@ class Runner(object):
             if d > self.max_d:
                 self.max_d = d
                 # print("Max dist  ", d)
-        if self.speed_only:
-            ownship_min_state = [0, self.tas_min, self.ax_min, 0, 0, 0]
-            ownship_max_state = [self.max_d, self.tas_max, self.ax_max, 360, self.max_d, 2]
+        ownship_min_state = [0, 0, 40, 0, 0]
+        ownship_max_state = [2, self.max_alt, 60, 1, self.max_alt]
 
-            intruder_min_state = [
-                self.min_x - self.max_x,
-                self.min_y - self.max_y,
-                0,
-                self.tas_min,
-                self.ax_min,
-                0,
-                0,
-                0,
-            ]
+        intruder_min_state = [
+            # self.min_x - self.max_x,
+            # self.min_y - self.max_y,
+            # 0,
+            # self.tas_min,
+            # self.ax_min,
+            # 0,
+            0,
+            0,
+            -self.max_alt
+        ]
 
-            intruder_max_state = [
-                self.max_x - self.min_x,
-                self.max_y - self.min_y,
-                self.max_d,
-                self.tas_max,
-                self.ax_max,
-                360,
-                self.max_d,
-                2,
-            ]
-        else:
-            ownship_min_state = [0, 0, 40, 0]
-            ownship_max_state = [2, self.max_alt, 60, 1]
-
-            intruder_min_state = [
-                # self.min_x - self.max_x,
-                # self.min_y - self.max_y,
-                # 0,
-                # self.tas_min,
-                # self.ax_min,
-                # 0,
-                0,
-                0,
-                0
-            ]
-
-            intruder_max_state = [
-                # self.max_x - self.min_x,
-                # self.max_y - self.min_y,
-                # self.max_d,
-                # self.tas_max,
-                # self.ax_max,
-                # 360,
-                self.max_d,
-                2,
-                self.max_alt
-            ]
+        intruder_max_state = [
+            # self.max_x - self.min_x,
+            # self.max_y - self.min_y,
+            # self.max_d,
+            # self.tas_max,
+            # self.ax_max,
+            # 360,
+            self.max_d,
+            2,
+            self.max_alt
+        ]
 
         # clearance denied, cleared, no clearance request
         # print("Checking if Traffic Manager is active: ", self.traffic_manager_active)
-        if self.speed_only:
-            if self.traffic_manager_active:
-                ownship_min_state += [0, 0]
-                ownship_max_state += [2, self.max_d]
-            ownship_min_state += [-180, 0] * self.n_waypoints
-            ownship_max_state += [180, self.max_d] * self.n_waypoints
-            intruder_min_state += [-180, 0] * self.n_waypoints
-            intruder_max_state += [180, self.max_d] * self.n_waypoints
 
         ## rel utm position, dist goal, speed, acceleration, heading, distance ownship to intruder, distance intruder intersection, distance ownship to intersection
         self.context_space = Box(
