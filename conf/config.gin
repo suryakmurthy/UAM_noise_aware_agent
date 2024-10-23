@@ -7,7 +7,7 @@ Driver.run_name = 'train_D2MAV_noise_aware' ## defines the directory name for sa
 Driver.run_type = 'train' # 'train' or 'eval'
 Driver.iterations= 10000
 Driver.num_workers = 5 # of parallel runners
-Driver.scenario_file = 'scenarios/generated_scenarios/austin_env_full_ver_4_new.scn' # default for final demo; or use scenarios/train
+Driver.scenario_file = 'scenarios/generated_scenarios/austin_env_full_ver_4.scn' # default for final demo; or use scenarios/train
 Driver.config_file = 'settings.cfg' #should not need to modify
 Driver.gui = False # Gui on or off
 

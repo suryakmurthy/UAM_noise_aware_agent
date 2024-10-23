@@ -7,7 +7,7 @@ Driver.run_name = 'test_D2MAV_cn_01' ## defines the directory name for saving mo
 Driver.run_type = 'eval' # 'train' or 'eval'
 Driver.iterations= 4000
 Driver.num_workers = 1 # of parallel runners
-Driver.scenario_file = 'scenarios/generated_scenarios/austin_env_full_ver_4_new.scn' # default for final demo; or use scenarios/train
+Driver.scenario_file = 'scenarios/generated_scenarios/austin_env_full_ver_4.scn' # default for final demo; or use scenarios/train
 Driver.config_file = 'settings.cfg' #should not need to modify
 Driver.gui = True # Gui on or off
 

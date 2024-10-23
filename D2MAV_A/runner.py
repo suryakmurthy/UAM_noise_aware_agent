@@ -1165,6 +1165,18 @@ class Runner(object):
                 ):  # TODO: This is a hyperparameter that needs to be moved to a config file
                     continue
 
+                if self.meters_to_feet(alt_own) >= self.min_alt:
+                    dist_between_ac = d[i, index]
+                    if np.abs(alt_own_rew - alt_intruder_rew) < self.LOS:
+                        same_alt_level += 1
+                        same_alt_list.append(id_j)
+                    else:
+                        if dist_between_ac < self.LOS:
+                            diff_alt_level += 1
+                        else:
+                            diff_alt_level += 1 - ((dist_between_ac - self.LOS) / (self.intruderThreshold - self.LOS))
+                        diff_alt_list.append(id_j)
+
                 if alt_intruder > 0:
                     intruder_noise_vals[index] = self.a_0 +  (self.a_1 * math.log10(alt_intruder_ft)) + (self.a_2 * ((math.log10(alt_intruder_ft))**2))
                 else:
@@ -1185,19 +1197,6 @@ class Runner(object):
                 if self.vehicle_helpers[id_].current_route_section != None and self.vehicle_helpers[id_j].current_route_section != None:
                     if self.vehicle_helpers[id_].current_route_section == self.vehicle_helpers[id_j].current_route_section:
                         continue
-
-                ## At this point. The intruder is only considered if the routes intersect
-                if self.meters_to_feet(alt_own) >= self.min_alt:
-                    dist_between_ac = d[i, index]
-                    if np.abs(alt_own_rew - alt_intruder_rew) < self.LOS:
-                        same_alt_level += 1
-                        same_alt_list.append(id_j)
-                    else:
-                        if dist_between_ac < self.LOS:
-                            diff_alt_level += 1
-                        else:
-                            diff_alt_level += 1 - ((dist_between_ac - self.LOS) / (self.intruderThreshold - self.LOS))
-                        diff_alt_list.append(id_j)
 
 
                 if dist_with_alt < self.LOS:
