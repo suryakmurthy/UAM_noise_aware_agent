@@ -1,16 +1,14 @@
-# Noise Aware Behavior in UAM Systems
+# A Reinforcement Learning Approach to Safe and Quiet UAM Traffic Management
 
-This is the github repository for the noise-aware agent developed for the NASA ULI project.
+This is the github repository for the noise-aware agent developed for the paper: A Reinforcement Learning Approach to Safe and Quiet UAM Traffic Management.
 
 # Installation Ubunutu
 
-
 ## 1. Install project dependencies
 
-
-1. Navigate to the ULI_noise_aware_agent directory
+1. Navigate to the UAM_noise_aware_agent directory
     ```bash
-    cd ULI_noise_aware_agent
+    cd UAM_noise_aware_agent
     ```
 2. Install bluesky
     ```python
@@ -19,11 +17,19 @@ This is the github repository for the noise-aware agent developed for the NASA U
 
 For more information on the BlueSky Simulator, please see: https://github.com/TUDelft-CNS-ATM/bluesky
 
+# Config Parameters:
+
+1. The simulation and model parameters are located in conf/config.gin and conf/config_test.gin.
+2. If you would like to change the config file used when running main.py, modify the argument in line 383 of main.py:
+    ```bash
+    gin.parse_config_file("conf/config_test.gin")
+    ```
+
 # Running Project
 
-1. Navigate to the ULI_noise_aware_agent directory
+1. Navigate to the UAM_noise_aware_agent directory
     ```bash
-    cd ULI_noise_aware_agent
+    cd UAM_noise_aware_agent
     ```
 2. Try running main script
     ```python
@@ -35,9 +41,9 @@ For more information on the BlueSky Simulator, please see: https://github.com/TU
 
 1. Follow steps 1-2 above (Section: Running Project) in a single terminal (Terminal 1). Open a **second** terminal (Terminal 2) and follow the steps below
 
-2. Navigate to the ULI_noise_aware_agent directory
+2. Navigate to the UAM_noise_aware_agent directory
     ```bash
-    cd ULI_noise_aware_agent
+    cd UAM_noise_aware_agent
     ```
 3. Start BlueSky
     ```bash
@@ -48,4 +54,4 @@ For more information on the BlueSky Simulator, please see: https://github.com/TU
 
 # Acknowledgements:
 
-This project uses the D2MAV-A model proposed by Brittain et. al.: https://arxiv.org/pdf/2003.08353
+This project builds on the D2MAV-A model proposed by Brittain et. al.: https://arxiv.org/pdf/2003.08353
